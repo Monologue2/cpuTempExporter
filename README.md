@@ -69,7 +69,54 @@ go_info{version="go1.22.1"} 1
 ### 커스텀 Metrics 추가하기
 상단의 애플리케이션은 기본 Go Metrics만 expose 합니다.<br>
 애플리케이션의 커스텀 Metrics을 등록할 수 있습니다.<br>
-이번 Example Application Exposes는 `myapp_processed_ops_total` [Counter](https://prometheus.io/docs/concepts/metric_types/#counter) 
+
+이번 Example Application Exposes는 [Counter](https://prometheus.io/docs/concepts/metric_types/#counter) Type의 `myapp_processed_ops_total` 을 노출시킵니다. 이는 지금까지 수행한 작업의 횟수를 계산합니다.<br>
+2초 마다 Counter는 1씩 증가하게 됩니다.
+
+```go
+package main
+
+import (
+	"net/http"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+)
+
+func recordMetrics() {
+	go func() {
+		for {
+			opsProcessed.Inc()
+			time.Sleep(2 * time.Second)
+		}
+	}()
+}
+
+var (
+	opsProcessed = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "myapp_processed_ops_total",
+		Help: "The total number of processed events",
+	})
+)
+
+func main() {
+	recordMetrics()
+
+	http.Handle("/metrics", promhttp.Handler())
+	http.ListenAndServe(":2112", nil)
+}
+```
+
+```bash
+$ go run main.go
+...
+# HELP myapp_processed_ops_total The total number of processed events
+# TYPE myapp_processed_ops_total counter
+myapp_processed_ops_total 5
+...
+```
 
 #### Metrics 유형
 > Prometheus Client Library는 4개의 주요 Metric Type을 제공합니다.<br>
@@ -82,7 +129,56 @@ go_info{version="go1.22.1"} 1
 
 저는 Cpu 온도 Metric을 받기 위해 `Gauge` Metric Type을 생성하고 `Collector`에 추가합니다.<br>
 `Counter`, `Histogram`, `Summary`는 다음에 써 볼 예정입니다.<br>
-특히 `Summary`의 Sliding Time Window 기능은 매우 강력해 보입니다.
+특히 `Summary`의 Sliding Time Window 기능은 매우 강력해 보입니다
+
+
+### CpuTemperatureExporter 구현하기
+Collector Interface에 따라 Describe, Collect를 구현해야합니다.<br>
+Desc Struct는 Expose할 Metric의 이름(fdName)과 설명(Help)를 가집니다.<br>
+Describe 메소드로 Desc Struct의 주소값을 채널로 전달합니다.<br>
+Collcet 메소드로 Desc, Metric Type, Metric 을 전달합니다.<br>
+
+Collect 메소드에 코드에 명시적인 루프나 동기화 매커니즘이 포함되어 있지 않아도<br>
+Prometheus의 주기적인 Scraping으로 주기적으로 Metric이 수집됩니다.
+```go
+// CPU 온도 Collector 정의
+// Collector Interface를 따라 Describe, Collect Method를 작성한다.
+type cpuTempCollector struct {
+	// prometheus.Desc은 이름, 도움말, 텍스트, 라벨을 포함하여 측정 항목에 대한 메타 데이터를 제공하는 설명자
+	tempDesc *prometheus.Desc
+}
+
+// 새 CPU 온도 Collector 생성
+func newCpuTempCollector() *cpuTempCollector {
+	return &cpuTempCollector{
+		// func NewDesc(fqName, help string, variableLabels []string, constLabels Labels) *Desc
+		// HELP cpu_temperature_celsius Current CPU temperature in Celsius
+		// 이름은 cpu_temperature_celsius, HELP 는 Current CPU temperature in Celsius
+		tempDesc: prometheus.NewDesc("cpu_temperature_celsius", "Current CPU temperature in Celsius", nil, nil),
+	}
+}
+
+// 수집기에서 메트릭을 수집하는 메서드 구현
+// func (m *MetricVec) Describe(ch chan<- *Desc)
+// Describe를 보내는 역할
+func (collector *cpuTempCollector) Describe(ch chan<- *prometheus.Desc) {
+	ch <- collector.tempDesc
+}
+
+// Collect, 실제 지표를 수집하는 역할
+func (collector *cpuTempCollector) Collect(ch chan<- prometheus.Metric) {
+	// Float64, Err 반환받음
+	temp, err := readCPUTemperature()
+	if err != nil {
+		log.Printf("Error reading CPU temperature: %v", err)
+		return
+	}
+	// Descriptor와 Gauge Metric Type, temp 전달
+	// func MustNewConstMetric(desc *Desc, valueType ValueType, value float64, labelValues ...string) Metric
+	ch <- prometheus.MustNewConstMetric(collector.tempDesc, prometheus.GaugeValue, temp)
+}
+...
+```
 
 
 
@@ -100,6 +196,24 @@ cpu_temperature_celsius 39
 ```
 `# HELP cpu_temperature_celsius Current CPU temperature in Celsius`<br>
 Metric의 설명을 제공합니다.
+
+### Scraping
+Metric Endpoint를 Prometheus에서 스크랩하도록 구성해야합니다.<br>
+```yaml
+scrape_configs:
+  - job_name: 'cpu_temperature_exporter'
+    scrape_interval: 15s
+    static_configs:
+      # Docker로 운영시 같은 network에 연결 후 Container Name을 써도 됩니다.
+      - targets: ['localhost:4000']
+```
+Prometheus가 15초마다 Endpoint를 Scraping 합니다.<br>
+Prometheus의 요청은  `promhttp.Handler()` 함수를 트리거하고<br>
+`promhttp.Handler()` 함수는 cpuTemCollecor의 `Collect` 메소드를 호출합니다.
+
+### Visualizing
+Grafana 에 Prometheus를 추가해둔 상태라면 대시보드를 추가하여 모니터링 가능합니다.<br>
+<img src="img/grafana_cputemp.png">
 
 <br>
 
